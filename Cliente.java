@@ -7,18 +7,27 @@ public class Cliente {
     private static final int PORTA_BROKER = 8080;
 
     public static void main(String[] args) {
+        Scanner scanner = new Scanner(System.in);
+
+        System.out.println("=== SISTEMA DE MENSAGENS IFSC ===");
+        System.out.print("Digite o nome de usuário que deseja usar: ");
+        String meuNome = scanner.nextLine();
+
         try (Socket socket = new Socket(IP_BROKER, PORTA_BROKER)) {
             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-            Scanner scanner = new Scanner(System.in);
 
-            // Thread para escutar mensagens do Broker em background
+            out.writeObject(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "", meuNome));
+            out.flush();
+
             Thread ouvinte = new Thread(() -> {
                 try {
                     while (true) {
                         Mensagem msgRecebida = (Mensagem) in.readObject();
-                        System.out.println("\n[NOVA MENSAGEM - " + msgRecebida.getTopico() + "]: " + msgRecebida.getPayload());
-                        System.out.print("Escolha uma opção (1-Criar, 2-Inscrever, 3-Publicar, 4-Desinscrever): ");
+                        System.out.println("\n\n[MENSAGEM EM " + msgRecebida.getTopico() + "]");
+                        System.out.println("De: " + msgRecebida.getRemetente());
+                        System.out.println("Conteúdo: " + msgRecebida.getPayload());
+                        System.out.print("Escolha uma opção: ");
                     }
                 } catch (Exception e) {
                     System.out.println("\nConexão com o broker encerrada.");
@@ -26,13 +35,12 @@ public class Cliente {
             });
             ouvinte.start();
 
-            // Loop principal (Menu do usuário)
             while (true) {
-                System.out.println("\n--- MENU MQTT ---");
+                System.out.println("\n--- MENU MQTT (Usuário: " + meuNome + ") ---");
                 System.out.println("1. Criar Tópico");
-                System.out.println("2. Inscrever-se em um Tópico (Subscribe)");
-                System.out.println("3. Publicar em um Tópico (Publish)");
-                System.out.println("4. Desinscrever-se (Unsubscribe)"); // <-- Nova opção
+                System.out.println("2. Inscrever-se (Subscribe)");
+                System.out.println("3. Publicar (Publish)");
+                System.out.println("4. Desinscrever-se (Unsubscribe)");
                 System.out.print("Escolha uma opção: ");
                 
                 String opcao = scanner.nextLine();
@@ -40,38 +48,32 @@ public class Cliente {
 
                 switch (opcao) {
                     case "1":
-                        System.out.print("Digite o nome do novo tópico: ");
+                        System.out.print("Nome do tópico: ");
                         topico = scanner.nextLine();
-                        out.writeObject(new Mensagem(Mensagem.TipoAcao.CRIAR_TOPICO, topico, ""));
-                        out.flush();
+                        out.writeObject(new Mensagem(Mensagem.TipoAcao.CRIAR_TOPICO, topico, "", meuNome));
                         break;
                     case "2":
-                        System.out.print("Digite o nome do tópico para se inscrever: ");
+                        System.out.print("Tópico para inscrição: ");
                         topico = scanner.nextLine();
-                        out.writeObject(new Mensagem(Mensagem.TipoAcao.SUBSCRIBE, topico, ""));
-                        out.flush();
+                        out.writeObject(new Mensagem(Mensagem.TipoAcao.SUBSCRIBE, topico, "", meuNome));
                         break;
                     case "3":
-                        System.out.print("Digite o nome do tópico alvo: ");
+                        System.out.print("Tópico alvo: ");
                         topico = scanner.nextLine();
-                        System.out.print("Digite a mensagem: ");
+                        System.out.print("Sua mensagem: ");
                         String payload = scanner.nextLine();
-                        out.writeObject(new Mensagem(Mensagem.TipoAcao.PUBLISH, topico, payload));
-                        out.flush();
+                        out.writeObject(new Mensagem(Mensagem.TipoAcao.PUBLISH, topico, payload, meuNome));
                         break;
-                    case "4": // <-- BLOCO NOVO ADICIONADO
-                        System.out.print("Digite o nome do tópico para sair: ");
+                    case "4":
+                        System.out.print("Tópico para sair: ");
                         topico = scanner.nextLine();
-                        out.writeObject(new Mensagem(Mensagem.TipoAcao.UNSUBSCRIBE, topico, ""));
-                        out.flush();
-                        System.out.println("Solicitação de saída enviada!");
+                        out.writeObject(new Mensagem(Mensagem.TipoAcao.UNSUBSCRIBE, topico, "", meuNome));
                         break;
-                    default:
-                        System.out.println("Opção inválida.");
                 }
+                out.flush();
             }
         } catch (IOException e) {
-            System.err.println("Erro ao conectar no Broker. Ele está rodando?");
+            System.err.println("Erro ao conectar no Broker.");
         }
     }
 }
