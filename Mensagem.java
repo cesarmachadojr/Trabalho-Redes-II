@@ -6,7 +6,8 @@ public class Mensagem implements Serializable {
     public enum TipoAcao {
         CRIAR_TOPICO,
         SUBSCRIBE,
-        PUBLISH
+        PUBLISH,
+        UNSUBSCRIBE // <-- Adicionado aqui
     }
 
     private TipoAcao acao;

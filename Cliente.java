@@ -18,7 +18,7 @@ public class Cliente {
                     while (true) {
                         Mensagem msgRecebida = (Mensagem) in.readObject();
                         System.out.println("\n[NOVA MENSAGEM - " + msgRecebida.getTopico() + "]: " + msgRecebida.getPayload());
-                        System.out.print("Escolha uma opção (1-Criar, 2-Inscrever, 3-Publicar): ");
+                        System.out.print("Escolha uma opção (1-Criar, 2-Inscrever, 3-Publicar, 4-Desinscrever): ");
                     }
                 } catch (Exception e) {
                     System.out.println("\nConexão com o broker encerrada.");
@@ -28,10 +28,11 @@ public class Cliente {
 
             // Loop principal (Menu do usuário)
             while (true) {
-                System.out.println("\n--- MENU MQTT (Sem Segurança) ---");
+                System.out.println("\n--- MENU MQTT ---");
                 System.out.println("1. Criar Tópico");
                 System.out.println("2. Inscrever-se em um Tópico (Subscribe)");
                 System.out.println("3. Publicar em um Tópico (Publish)");
+                System.out.println("4. Desinscrever-se (Unsubscribe)"); // <-- Nova opção
                 System.out.print("Escolha uma opção: ");
                 
                 String opcao = scanner.nextLine();
@@ -57,6 +58,13 @@ public class Cliente {
                         String payload = scanner.nextLine();
                         out.writeObject(new Mensagem(Mensagem.TipoAcao.PUBLISH, topico, payload));
                         out.flush();
+                        break;
+                    case "4": // <-- BLOCO NOVO ADICIONADO
+                        System.out.print("Digite o nome do tópico para sair: ");
+                        topico = scanner.nextLine();
+                        out.writeObject(new Mensagem(Mensagem.TipoAcao.UNSUBSCRIBE, topico, ""));
+                        out.flush();
+                        System.out.println("Solicitação de saída enviada!");
                         break;
                     default:
                         System.out.println("Opção inválida.");

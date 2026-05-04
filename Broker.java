@@ -58,13 +58,22 @@ public class Broker {
                             }
                             break;
 
+                        case UNSUBSCRIBE: // <-- BLOCO NOVO ADICIONADO
+                            List<ObjectOutputStream> inscritosParaSair = topicos.get(msg.getTopico());
+                            if (inscritosParaSair != null) {
+                                // Remove o stream deste cliente da lista de envio
+                                inscritosParaSair.remove(out);
+                                System.out.println("Cliente desinscrito do tópico: " + msg.getTopico());
+                            }
+                            break;
+
                         case PUBLISH:
                             List<ObjectOutputStream> alvo = topicos.get(msg.getTopico());
                             if (alvo != null) {
                                 System.out.println("Roteando mensagem para o tópico: " + msg.getTopico() + " (" + alvo.size() + " inscritos)");
                                 
                                 for (ObjectOutputStream clienteOut : alvo) {
-                                    // MUDANÇA: Try-catch dentro do loop. Se um cliente falhar, não afeta os outros!
+                                    // Try-catch dentro do loop. Se um cliente falhar, não afeta os outros!
                                     try {
                                         synchronized (clienteOut) {
                                             clienteOut.writeUnshared(msg); // writeUnshared ignora o cache do Java
