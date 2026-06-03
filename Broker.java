@@ -2,20 +2,34 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.security.*;
 
 public class Broker {
     private static final int PORTA = 8080;
-    
-    // Armazena as conexões socket ativas na sessão por tópico
+
+    // --- AUTENTICAÇÃO: Chave pública do servidor carregada do arquivo ---
+    private static PublicKey chavePublicaServidor;
+
+    // Conexões socket ativas por tópico
     private static ConcurrentHashMap<String, List<ObjectOutputStream>> topicosAtivos = new ConcurrentHashMap<>();
-    
-    // Mapeamento auxiliar para correlacionar o fluxo de saída com o Nome do Cliente ativo
+
+    // Correlaciona fluxo de saída com o nome do cliente
     private static ConcurrentHashMap<ObjectOutputStream, String> nomesConexoes = new ConcurrentHashMap<>();
-    
-    // Gerenciador de buffer de mensagens e membros históricos por tópico
+
+    // Buffer de mensagens e membros históricos por tópico
     private static ConcurrentHashMap<String, HistoricoTopico> dadosTopicos = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
+        // --- AUTENTICAÇÃO: Carrega a chave pública antes de iniciar o servidor ---
+        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream("servidor.pub"))) {
+            chavePublicaServidor = (PublicKey) in.readObject();
+            System.out.println("Chave Publica carregada com sucesso. Autenticacao ativada.");
+        } catch (Exception e) {
+            System.err.println("Erro critico: Arquivo 'servidor.pub' nao encontrado!");
+            System.err.println("Por favor, rode o ProcessoOffline primeiro para gerar as chaves.");
+            return;
+        }
+
         System.out.println("Broker iniciado na porta " + PORTA + "...");
         try (ServerSocket serverSocket = new ServerSocket(PORTA)) {
             while (true) {
@@ -70,11 +84,15 @@ public class Broker {
         public boolean estaVazio() {
             return membrosHistoricos.isEmpty() && bufferMensagens.isEmpty();
         }
+
+        // --- RECONEXÃO: Verifica se o cliente ainda é membro histórico do tópico ---
+        public boolean contemMembro(String nome) {
+            return membrosHistoricos.contains(nome);
+        }
     }
 
-    // --- CORRIGIDO: Atributos declarados explicitamente com escopo correto ---
     private static class MensagemBufferizada {
-        public Mensagem mensagemOriginal; // Nome corrigido para bater com o resto do broker
+        public Mensagem mensagemOriginal;
         public Set<String> usuariosPendentes;
 
         public MensagemBufferizada(Mensagem mensagemOriginal, Set<String> usuariosPendentes) {
@@ -100,54 +118,128 @@ public class Broker {
                     Mensagem msg = (Mensagem) in.readObject();
 
                     switch (msg.getAcao()) {
+
                         case IDENTIFICAR:
                             this.nomeDoCliente = msg.getRemetente();
+
+                            // --- AUTENTICAÇÃO: Verificação da assinatura digital RSA ---
+                            boolean autenticado = false;
+                            try {
+                                if (msg.getAssinatura() != null) {
+                                    Signature rsa = Signature.getInstance("SHA256withRSA");
+                                    rsa.initVerify(chavePublicaServidor);
+                                    rsa.update(this.nomeDoCliente.getBytes());
+                                    autenticado = rsa.verify(msg.getAssinatura());
+                                }
+                            } catch (Exception ex) {
+                                autenticado = false;
+                            }
+
+                            if (!autenticado) {
+                                System.out.println("ALERTA DE SEGURANCA: Conexao recusada para '" + this.nomeDoCliente + "'. Assinatura digital invalida!");
+                                try {
+                                    out.writeObject(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "ERRO_AUTENTICACAO", "Broker"));
+                                    out.flush();
+                                } catch (IOException e) {}
+                                socket.close();
+                                return;
+                            }
+
                             nomesConexoes.put(out, nomeDoCliente);
-                            System.out.println("LOGIN: " + nomeDoCliente);
-                            
+                            System.out.println("LOGIN AUTENTICADO: " + nomeDoCliente);
+
+                            // --- RECONEXÃO: Reinserção automática nos tópicos onde o cliente já era membro ---
+                            // O HistoricoTopico mantém membrosHistoricos mesmo após desconexão,
+                            // então usamos isso para detectar os tópicos do cliente e reinscrever.
+                            for (Map.Entry<String, HistoricoTopico> entry : dadosTopicos.entrySet()) {
+                                String topico = entry.getKey();
+                                HistoricoTopico hist = entry.getValue();
+
+                                if (hist.contemMembro(nomeDoCliente)) {
+                                    // Garante que o tópico existe em topicosAtivos
+                                    topicosAtivos.putIfAbsent(topico, new CopyOnWriteArrayList<>());
+                                    List<ObjectOutputStream> inscritos = topicosAtivos.get(topico);
+
+                                    // Reinserção apenas se não estiver já inscrito (evita duplicata)
+                                    if (!inscritos.contains(out)) {
+                                        inscritos.add(out);
+                                        System.out.println("RECONEXAO: " + nomeDoCliente + " reinscrito automaticamente em: " + topico);
+                                    }
+
+                                    // Envia ACK para o cliente repovoar a lista de tópicos na GUI
+                                    try {
+                                        synchronized (out) {
+                                            out.writeUnshared(new Mensagem(Mensagem.TipoAcao.ACK, topico, "OK", "Broker"));
+                                            out.flush();
+                                            out.reset();
+                                        }
+                                    } catch (IOException e) { /* ignora */ }
+                                }
+                            }
+                            // ---------------------------------------------------------------------------------
+
                             enviarMensagensPendentes();
                             break;
 
                         case CRIAR_TOPICO:
                             topicosAtivos.putIfAbsent(msg.getTopico(), new CopyOnWriteArrayList<>());
                             dadosTopicos.putIfAbsent(msg.getTopico(), new HistoricoTopico());
-                            
+
                             List<ObjectOutputStream> inscritosCriacao = topicosAtivos.get(msg.getTopico());
                             if (!inscritosCriacao.contains(out)) {
                                 inscritosCriacao.add(out);
                                 dadosTopicos.get(msg.getTopico()).adicionarMembro(nomeDoCliente);
                                 System.out.println("TOPICO: " + nomeDoCliente + " criou e se inscreveu em: " + msg.getTopico());
                             }
+
+                            // --- CORREÇÃO 1: Envia ACK de confirmação ao cliente ---
+                            try {
+                                synchronized (out) {
+                                    out.writeUnshared(new Mensagem(Mensagem.TipoAcao.ACK, msg.getTopico(), "OK", "Broker"));
+                                    out.flush();
+                                    out.reset();
+                                }
+                            } catch (IOException e) { /* ignora falha no ACK */ }
                             break;
 
                         case SUBSCRIBE:
                             topicosAtivos.putIfAbsent(msg.getTopico(), new CopyOnWriteArrayList<>());
                             dadosTopicos.putIfAbsent(msg.getTopico(), new HistoricoTopico());
-                            
+
                             List<ObjectOutputStream> inscritosManual = topicosAtivos.get(msg.getTopico());
                             if (!inscritosManual.contains(out)) {
                                 inscritosManual.add(out);
                                 dadosTopicos.get(msg.getTopico()).adicionarMembro(nomeDoCliente);
                                 System.out.println("SUB: " + nomeDoCliente + " se inscreveu em: " + msg.getTopico());
-                                
                                 enviarMensagensPendentesDoTopico(msg.getTopico());
                             }
+
+                            // --- CORREÇÃO 1: Envia ACK de confirmação ao cliente ---
+                            try {
+                                synchronized (out) {
+                                    out.writeUnshared(new Mensagem(Mensagem.TipoAcao.ACK, msg.getTopico(), "OK", "Broker"));
+                                    out.flush();
+                                    out.reset();
+                                }
+                            } catch (IOException e) { /* ignora falha no ACK */ }
                             break;
 
                         case UNSUBSCRIBE:
+                            // --- CORREÇÃO 2: Entrega mensagens pendentes ANTES de remover o membro do histórico ---
+                            enviarMensagensPendentesDoTopico(msg.getTopico());
                             removerClienteDoTopico(msg.getTopico());
                             break;
 
                         case PUBLISH:
                             List<ObjectOutputStream> alvo = topicosAtivos.get(msg.getTopico());
-                            
+
                             if (alvo == null || !alvo.contains(out)) {
                                 System.out.println("BLOQUEADO: " + nomeDoCliente + " tentou postar em " + msg.getTopico() + " sem estar inscrito.");
-                                break; 
+                                break;
                             }
 
                             System.out.println("PUB: " + nomeDoCliente + " postou em " + msg.getTopico());
-                            
+
                             HistoricoTopico historico = dadosTopicos.get(msg.getTopico());
                             if (historico != null) {
                                 historico.adicionarMensagem(msg);
@@ -160,13 +252,12 @@ public class Broker {
                                         clienteOut.flush();
                                         clienteOut.reset();
                                     }
-                                    
                                     String nomeDestinatario = nomesConexoes.get(clienteOut);
                                     if (nomeDestinatario != null && historico != null) {
                                         historico.confirmarDownload(nomeDestinatario, msg);
                                     }
-                                } catch (IOException e) { 
-                                    alvo.remove(clienteOut); 
+                                } catch (IOException e) {
+                                    alvo.remove(clienteOut);
                                 }
                             }
                             break;
@@ -191,7 +282,7 @@ public class Broker {
                 System.out.println("UNSUB: " + nomeDoCliente + " saiu de: " + topico);
                 if (lista.isEmpty()) topicosAtivos.remove(topico);
             }
-            
+
             HistoricoTopico hist = dadosTopicos.get(topico);
             if (hist != null) {
                 hist.removerMembro(nomeDoCliente);
@@ -223,7 +314,7 @@ public class Broker {
                             }
                             hist.confirmarDownload(nomeDoCliente, m);
                         } catch (IOException e) {
-                            break; 
+                            break;
                         }
                     }
                 }

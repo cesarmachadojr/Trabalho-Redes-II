@@ -55,7 +55,7 @@ public class ClienteGUI extends JFrame {
         btnCriarTopico = new JButton("Criar Tópico");
         btnInscrever = new JButton("Inscrever-se (Subscribe)");
         btnSairTopico = new JButton("Desinscrever-se (Unsubscribe)");
-        
+
         painelAcoesTopico.add(btnCriarTopico);
         painelAcoesTopico.add(btnInscrever);
         painelAcoesTopico.add(btnSairTopico);
@@ -67,10 +67,10 @@ public class ClienteGUI extends JFrame {
         JScrollPane scrollTopicos = new JScrollPane(listTopicos);
         scrollTopicos.setBorder(BorderFactory.createTitledBorder("Tópicos Ativos"));
         painelEsquerdo.add(scrollTopicos, BorderLayout.CENTER);
-        
+
         add(painelEsquerdo, BorderLayout.WEST);
 
-        // 3. Painel Central/Direito: Visualização do Chat e Envio de Mensagens
+        // 3. Painel Central: Chat e Envio de Mensagens
         JPanel painelCentral = new JPanel(new BorderLayout(5, 5));
         painelCentral.setBorder(BorderFactory.createTitledBorder("Painel de Mensagens"));
 
@@ -88,40 +88,35 @@ public class ClienteGUI extends JFrame {
 
         add(painelCentral, BorderLayout.CENTER);
 
-        // Bloquear componentes até que o usuário se conecte
+        // Bloquear componentes até conectar
         alternarComponentes(false);
 
-        // --- Configuração dos Listeners / Eventos de Clique ---
-        
-        // Ação: Conectar ao Broker
+        // --- Listeners ---
+
         btnConectar.addActionListener(e -> conectarAoBroker());
 
-        // Ação: Criar Tópico
-        btnCriarTopico.addActionListener(e -> enviarComando(Mensagem.TipoAcao.CRIAR_TOPICO, txtTopico.getText().trim(), "", true));
+        // --- CORREÇÃO 1: Não adiciona na lista aqui; aguarda ACK do broker (tratado no OuvinteServidor) ---
+        btnCriarTopico.addActionListener(e -> enviarComando(Mensagem.TipoAcao.CRIAR_TOPICO, txtTopico.getText().trim(), ""));
+        btnInscrever.addActionListener(e -> enviarComando(Mensagem.TipoAcao.SUBSCRIBE, txtTopico.getText().trim(), ""));
 
-        // Ação: Se inscrever
-        btnInscrever.addActionListener(e -> enviarComando(Mensagem.TipoAcao.SUBSCRIBE, txtTopico.getText().trim(), "", true));
-
-        // Ação: Sair de um tópico
         btnSairTopico.addActionListener(e -> {
             String selecionado = listTopicos.getSelectedValue();
             if (selecionado != null) {
-                enviarComando(Mensagem.TipoAcao.UNSUBSCRIBE, selecionado, "", false);
+                enviarComando(Mensagem.TipoAcao.UNSUBSCRIBE, selecionado, "");
+                // Remoção local imediata é segura aqui pois o broker entregará pendentes antes de remover
                 modelTopicos.removeElement(selecionado);
             } else {
                 JOptionPane.showMessageDialog(this, "Selecione um tópico na lista para sair.");
             }
         });
 
-        // Ação: Enviar Mensagem (Publish)
         btnEnviar.addActionListener(e -> enviarMensagemPublicacao());
-        txtMensagem.addActionListener(e -> enviarMensagemPublicacao()); // Envia também ao apertar Enter
+        txtMensagem.addActionListener(e -> enviarMensagemPublicacao());
     }
 
     private void alternarComponentes(boolean conectado) {
         txtNome.setEnabled(!conectado);
         btnConectar.setEnabled(!conectado);
-        
         txtTopico.setEnabled(conectado);
         btnCriarTopico.setEnabled(conectado);
         btnInscrever.setEnabled(conectado);
@@ -138,19 +133,30 @@ public class ClienteGUI extends JFrame {
             return;
         }
 
+        // --- AUTENTICAÇÃO: Carrega o arquivo de assinatura digital offline do cliente ---
+        byte[] minhaAssinatura = null;
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(meuNome + ".assinatura"))) {
+            minhaAssinatura = (byte[]) ois.readObject();
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(this, "Erro de Autenticação: Arquivo '" + meuNome + ".assinatura' não encontrado!\n" +
+                    "Certifique-se de gerar as credenciais no Processo Offline primeiro.");
+            return;
+        }
+
         try {
             socket = new Socket(IP_BROKER, PORTA_BROKER);
             out = new ObjectOutputStream(socket.getOutputStream());
             in = new ObjectInputStream(socket.getInputStream());
 
-            // Envia comando de identificação inicial
-            out.writeObject(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "", meuNome));
+            // Envia identificação com assinatura digital
+            out.writeObject(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "", meuNome, minhaAssinatura));
             out.flush();
 
             alternarComponentes(true);
+            modelTopicos.clear(); // Limpa lista local; o broker vai reenviar ACKs dos tópicos ativos
             areaChat.append("System: Conectado com sucesso como [" + meuNome + "]\n");
 
-            // Inicia a thread ouvinte do Broker
+            // Inicia thread ouvinte do Broker
             new Thread(new OuvinteServidor()).start();
 
         } catch (IOException ex) {
@@ -158,7 +164,8 @@ public class ClienteGUI extends JFrame {
         }
     }
 
-    private void enviarComando(Mensagem.TipoAcao acao, String topico, String payload, boolean adicionarNaLista) {
+    // --- CORREÇÃO 1: Removido o parâmetro adicionarNaLista; adição ocorre somente via ACK ---
+    private void enviarComando(Mensagem.TipoAcao acao, String topico, String payload) {
         if (topico.isEmpty()) {
             JOptionPane.showMessageDialog(this, "Preencha o nome do tópico.");
             return;
@@ -166,10 +173,6 @@ public class ClienteGUI extends JFrame {
         try {
             out.writeObject(new Mensagem(acao, topico, payload, meuNome));
             out.flush();
-            
-            if (adicionarNaLista && !modelTopicos.contains(topico)) {
-                modelTopicos.addElement(topico);
-            }
             txtTopico.setText("");
         } catch (IOException ex) {
             areaChat.append("System: Falha ao enviar comando para o broker.\n");
@@ -195,22 +198,46 @@ public class ClienteGUI extends JFrame {
         }
     }
 
-    // Thread que fica escutando o servidor continuamente sem travar a janela
+    // Thread que escuta o servidor continuamente sem travar a janela
     private class OuvinteServidor implements Runnable {
         @Override
         public void run() {
             try {
                 while (true) {
                     Mensagem msg = (Mensagem) in.readObject();
-                    
-                    // Exigência do PDF: Indicar claramente o cliente e o tópico de origem
-                    String formatada = String.format("[%s - %s]: %s\n", 
-                            msg.getRemetente(), 
-                            msg.getTopico(), 
+
+                    // --- AUTENTICAÇÃO: Trata recusa de conexão ---
+                    if ("ERRO_AUTENTICACAO".equals(msg.getPayload())) {
+                        SwingUtilities.invokeLater(() -> {
+                            JOptionPane.showMessageDialog(ClienteGUI.this,
+                                "O Servidor recusou o login: Assinatura digital inválida ou corrompida!",
+                                "Erro de Segurança", JOptionPane.ERROR_MESSAGE);
+                            alternarComponentes(false);
+                            modelTopicos.clear();
+                        });
+                        break;
+                    }
+
+                    // --- CORREÇÃO 1: Trata ACK do broker para adicionar tópico na lista apenas após confirmação ---
+                    if (msg.getAcao() == Mensagem.TipoAcao.ACK) {
+                        if ("OK".equals(msg.getPayload())) {
+                            String topico = msg.getTopico();
+                            SwingUtilities.invokeLater(() -> {
+                                if (!modelTopicos.contains(topico)) {
+                                    modelTopicos.addElement(topico);
+                                }
+                                areaChat.append("System: Inscrição confirmada no tópico [" + topico + "]\n");
+                            });
+                        }
+                        continue; // ACK processado, não exibe como mensagem de chat
+                    }
+
+                    // Exibe mensagem de chat com cliente e tópico de origem
+                    String formatada = String.format("[%s - %s]: %s\n",
+                            msg.getRemetente(),
+                            msg.getTopico(),
                             msg.getPayload()
                     );
-                    
-                    // Adiciona na interface gráfica de forma segura para threads
                     SwingUtilities.invokeLater(() -> areaChat.append(formatada));
                 }
             } catch (Exception e) {
@@ -223,11 +250,7 @@ public class ClienteGUI extends JFrame {
     }
 
     public static void main(String[] args) {
-        // Inicializa o LookAndFeel nativo do sistema operacional para ficar bonito
         try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception e) {}
-        
-        SwingUtilities.invokeLater(() -> {
-            new ClienteGUI().setVisible(true);
-        });
+        SwingUtilities.invokeLater(() -> new ClienteGUI().setVisible(true));
     }
 }
