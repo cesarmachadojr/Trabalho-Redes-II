@@ -3,34 +3,36 @@ import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.security.*;
+import java.security.cert.Certificate;
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 public class Broker {
     private static final int PORTA = 8080;
+    private static PrivateKey chavePrivadaBroker;
+    private static Certificate certificadoBroker;
 
-    // --- AUTENTICAÇÃO: Chave pública do servidor carregada do arquivo ---
-    private static PublicKey chavePublicaServidor;
-
-    // Conexões socket ativas por tópico
-    private static ConcurrentHashMap<String, List<ObjectOutputStream>> topicosAtivos = new ConcurrentHashMap<>();
-
-    // Correlaciona fluxo de saída com o nome do cliente
-    private static ConcurrentHashMap<ObjectOutputStream, String> nomesConexoes = new ConcurrentHashMap<>();
-
-    // Buffer de mensagens e membros históricos por tópico
+    private static ConcurrentHashMap<String, List<TrataCliente>> topicosAtivos = new ConcurrentHashMap<>();
+    private static ConcurrentHashMap<TrataCliente, String> nomesConexoes = new ConcurrentHashMap<>();
     private static ConcurrentHashMap<String, HistoricoTopico> dadosTopicos = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
-        // --- AUTENTICAÇÃO: Carrega a chave pública antes de iniciar o servidor ---
-        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream("servidor.pub"))) {
-            chavePublicaServidor = (PublicKey) in.readObject();
-            System.out.println("Chave Publica carregada com sucesso. Autenticacao ativada.");
+        try {
+            char[] senha = "123456".toCharArray();
+            KeyStore ks = KeyStore.getInstance("JKS");
+            try (FileInputStream fis = new FileInputStream("broker.keystore")) {
+                ks.load(fis, senha);
+            }
+            chavePrivadaBroker = (PrivateKey) ks.getKey("broker", senha);
+            certificadoBroker = ks.getCertificate("broker");
+            System.out.println("[INFO] KeyStore carregado com sucesso.");
         } catch (Exception e) {
-            System.err.println("Erro critico: Arquivo 'servidor.pub' nao encontrado!");
-            System.err.println("Por favor, rode o ProcessoOffline primeiro para gerar as chaves.");
+            System.err.println("[ERRO CRÍTICO] Falha ao carregar o arquivo 'broker.keystore'!");
             return;
         }
 
-        System.out.println("Broker iniciado na porta " + PORTA + "...");
+        System.out.println("Broker Seguro iniciado na porta " + PORTA + "...");
         try (ServerSocket serverSocket = new ServerSocket(PORTA)) {
             while (true) {
                 Socket socketCliente = serverSocket.accept();
@@ -39,25 +41,19 @@ public class Broker {
         } catch (IOException e) { e.printStackTrace(); }
     }
 
-    // --- CLASSE AUXILIAR: Gerencia a retenção de mensagens por tópico ---
     private static class HistoricoTopico {
         private final Set<String> membrosHistoricos = ConcurrentHashMap.newKeySet();
         private final List<MensagemBufferizada> bufferMensagens = new CopyOnWriteArrayList<>();
 
-        public void adicionarMembro(String nome) {
-            membrosHistoricos.add(nome);
-        }
-
+        public void adicionarMembro(String nome) { membrosHistoricos.add(nome); }
         public void removerMembro(String nome) {
             membrosHistoricos.remove(nome);
             verificarEExcluirMensagensLidas();
         }
-
         public void adicionarMensagem(Mensagem msg) {
             MensagemBufferizada novaMsg = new MensagemBufferizada(msg, new HashSet<>(membrosHistoricos));
             bufferMensagens.add(novaMsg);
         }
-
         public List<Mensagem> obterPendentesDoCliente(String nomeCliente) {
             List<Mensagem> pendentes = new ArrayList<>();
             for (MensagemBufferizada mb : bufferMensagens) {
@@ -67,7 +63,6 @@ public class Broker {
             }
             return pendentes;
         }
-
         public void confirmarDownload(String nomeCliente, Mensagem msgOriginal) {
             for (MensagemBufferizada mb : bufferMensagens) {
                 if (mb.mensagemOriginal == msgOriginal) {
@@ -76,25 +71,14 @@ public class Broker {
             }
             verificarEExcluirMensagensLidas();
         }
-
-        private void verificarEExcluirMensagensLidas() {
-            bufferMensagens.removeIf(mb -> mb.usuariosPendentes.isEmpty());
-        }
-
-        public boolean estaVazio() {
-            return membrosHistoricos.isEmpty() && bufferMensagens.isEmpty();
-        }
-
-        // --- RECONEXÃO: Verifica se o cliente ainda é membro histórico do tópico ---
-        public boolean contemMembro(String nome) {
-            return membrosHistoricos.contains(nome);
-        }
+        public boolean estaVazio() { return membrosHistoricos.isEmpty() && bufferMensagens.isEmpty(); }
+        public boolean contemMembro(String nome) { return membrosHistoricos.contains(nome); }
+        private void verificarEExcluirMensagensLidas() { bufferMensagens.removeIf(mb -> mb.usuariosPendentes.isEmpty()); }
     }
 
     private static class MensagemBufferizada {
         public Mensagem mensagemOriginal;
         public Set<String> usuariosPendentes;
-
         public MensagemBufferizada(Mensagem mensagemOriginal, Set<String> usuariosPendentes) {
             this.mensagemOriginal = mensagemOriginal;
             this.usuariosPendentes = Collections.synchronizedSet(usuariosPendentes);
@@ -105,8 +89,38 @@ public class Broker {
         private Socket socket;
         private String nomeDoCliente = "Desconhecido";
         private ObjectOutputStream out;
+        private SecretKeySpec chaveAES;
 
         public TrataCliente(Socket socket) { this.socket = socket; }
+
+        // CORREÇÃO: Envio de canal gera agora um IV dinâmico (SecureRandom) a cada mensagem
+        public void enviarMensagemParaCliente(Mensagem msg) throws Exception {
+            synchronized (out) {
+                if (this.chaveAES != null) {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+                        oos.writeObject(msg);
+                    }
+                    byte[] dadosClaros = baos.toByteArray();
+
+                    byte[] ivDinamico = new byte[16];
+                    new SecureRandom().nextBytes(ivDinamico);
+
+                    Cipher cipherAES = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                    cipherAES.init(Cipher.ENCRYPT_MODE, this.chaveAES, new IvParameterSpec(ivDinamico));
+                    byte[] dadosCifrados = cipherAES.doFinal(dadosClaros);
+
+                    Mensagem envelope = new Mensagem(Mensagem.TipoAcao.MENSAGEM_CIFRADA_CANAL, "", "", "Broker");
+                    envelope.setDadosCifradosCanal(dadosCifrados);
+                    envelope.setIvCanal(ivDinamico); // Anexa o IV ao pacote
+                    out.writeUnshared(envelope);
+                } else {
+                    out.writeUnshared(msg);
+                }
+                out.flush();
+                out.reset();
+            }
+        }
 
         @Override
         public void run() {
@@ -115,208 +129,168 @@ public class Broker {
                 ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
                 while (true) {
-                    Mensagem msg = (Mensagem) in.readObject();
+                    Mensagem msgEntrada = (Mensagem) in.readObject();
+                    if (msgEntrada == null) continue;
+
+                    Mensagem msg = msgEntrada;
+
+                    // CORREÇÃO: Desencriptação utiliza agora o IV dinâmico vindo da mensagem instanciada
+                    if (msgEntrada.getAcao() == Mensagem.TipoAcao.MENSAGEM_CIFRADA_CANAL) {
+                        if (this.chaveAES == null) {
+                            socket.close();
+                            return;
+                        }
+                        Cipher decipherAES = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                        decipherAES.init(Cipher.DECRYPT_MODE, this.chaveAES, new IvParameterSpec(msgEntrada.getIvCanal()));
+                        byte[] dadosClaros = decipherAES.doFinal(msgEntrada.getDadosCifradosCanal());
+                        
+                        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(dadosClaros))) {
+                            msg = (Mensagem) ois.readObject();
+                        }
+                    }
 
                     switch (msg.getAcao()) {
+                        case SOLICITAR_CERTIFICADO:
+                            synchronized (out) {
+                                out.writeObject(certificadoBroker);
+                                out.flush();
+                                out.reset();
+                            }
+                            break;
+
+                        case CHAVE_SESSAO:
+                            try {
+                                byte[] dadosCifrados = msg.getPayloadCifradoPontaAPonta(); 
+                                Cipher cipherRSA = Cipher.getInstance("RSA");
+                                cipherRSA.init(Cipher.DECRYPT_MODE, chavePrivadaBroker);
+                                byte[] dadosDecifrados = cipherRSA.doFinal(dadosCifrados);
+                                
+                                byte[] chaveBytes = Arrays.copyOfRange(dadosDecifrados, 0, 32);
+                                this.chaveAES = new SecretKeySpec(chaveBytes, "AES");
+                                
+                                enviarMensagemParaCliente(new Mensagem(Mensagem.TipoAcao.ACK, "", "CHAVE_ACEITA", "Broker"));
+                            } catch (Exception ex) {
+                                socket.close();
+                                return;
+                            }
+                            break;
 
                         case IDENTIFICAR:
                             this.nomeDoCliente = msg.getRemetente();
-
-                            // --- AUTENTICAÇÃO: Verificação da assinatura digital RSA ---
                             boolean autenticado = false;
                             try {
                                 if (msg.getAssinatura() != null) {
                                     Signature rsa = Signature.getInstance("SHA256withRSA");
-                                    rsa.initVerify(chavePublicaServidor);
+                                    rsa.initVerify(certificadoBroker.getPublicKey());
                                     rsa.update(this.nomeDoCliente.getBytes());
                                     autenticado = rsa.verify(msg.getAssinatura());
                                 }
-                            } catch (Exception ex) {
-                                autenticado = false;
-                            }
+                            } catch (Exception ex) { autenticado = false; }
 
                             if (!autenticado) {
-                                System.out.println("ALERTA DE SEGURANCA: Conexao recusada para '" + this.nomeDoCliente + "'. Assinatura digital invalida!");
-                                try {
-                                    out.writeObject(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "ERRO_AUTENTICACAO", "Broker"));
-                                    out.flush();
-                                } catch (IOException e) {}
+                                try { enviarMensagemParaCliente(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "ERRO_AUTENTICACAO", "Broker")); } catch (Exception e) {}
                                 socket.close();
                                 return;
                             }
 
-                            nomesConexoes.put(out, nomeDoCliente);
+                            nomesConexoes.put(this, nomeDoCliente);
                             System.out.println("LOGIN AUTENTICADO: " + nomeDoCliente);
 
-                            // --- RECONEXÃO: Reinserção automática nos tópicos onde o cliente já era membro ---
-                            // O HistoricoTopico mantém membrosHistoricos mesmo após desconexão,
-                            // então usamos isso para detectar os tópicos do cliente e reinscrever.
                             for (Map.Entry<String, HistoricoTopico> entry : dadosTopicos.entrySet()) {
                                 String topico = entry.getKey();
                                 HistoricoTopico hist = entry.getValue();
-
                                 if (hist.contemMembro(nomeDoCliente)) {
-                                    // Garante que o tópico existe em topicosAtivos
                                     topicosAtivos.putIfAbsent(topico, new CopyOnWriteArrayList<>());
-                                    List<ObjectOutputStream> inscritos = topicosAtivos.get(topico);
-
-                                    // Reinserção apenas se não estiver já inscrito (evita duplicata)
-                                    if (!inscritos.contains(out)) {
-                                        inscritos.add(out);
-                                        System.out.println("RECONEXAO: " + nomeDoCliente + " reinscrito automaticamente em: " + topico);
-                                    }
-
-                                    // Envia ACK para o cliente repovoar a lista de tópicos na GUI
-                                    try {
-                                        synchronized (out) {
-                                            out.writeUnshared(new Mensagem(Mensagem.TipoAcao.ACK, topico, "OK", "Broker"));
-                                            out.flush();
-                                            out.reset();
-                                        }
-                                    } catch (IOException e) { /* ignora */ }
+                                    List<TrataCliente> inscritos = topicosAtivos.get(topico);
+                                    if (!inscritos.contains(this)) inscritos.add(this);
                                 }
                             }
-                            // ---------------------------------------------------------------------------------
-
                             enviarMensagensPendentes();
                             break;
 
                         case CRIAR_TOPICO:
                             topicosAtivos.putIfAbsent(msg.getTopico(), new CopyOnWriteArrayList<>());
                             dadosTopicos.putIfAbsent(msg.getTopico(), new HistoricoTopico());
-
-                            List<ObjectOutputStream> inscritosCriacao = topicosAtivos.get(msg.getTopico());
-                            if (!inscritosCriacao.contains(out)) {
-                                inscritosCriacao.add(out);
+                            List<TrataCliente> inscritosCriacao = topicosAtivos.get(msg.getTopico());
+                            if (!inscritosCriacao.contains(this)) {
+                                inscritosCriacao.add(this);
                                 dadosTopicos.get(msg.getTopico()).adicionarMembro(nomeDoCliente);
-                                System.out.println("TOPICO: " + nomeDoCliente + " criou e se inscreveu em: " + msg.getTopico());
                             }
-
-                            // --- CORREÇÃO 1: Envia ACK de confirmação ao cliente ---
-                            try {
-                                synchronized (out) {
-                                    out.writeUnshared(new Mensagem(Mensagem.TipoAcao.ACK, msg.getTopico(), "OK", "Broker"));
-                                    out.flush();
-                                    out.reset();
-                                }
-                            } catch (IOException e) { /* ignora falha no ACK */ }
+                            enviarMensagemParaCliente(new Mensagem(Mensagem.TipoAcao.ACK, msg.getTopico(), "OK", "Broker"));
                             break;
 
                         case SUBSCRIBE:
                             topicosAtivos.putIfAbsent(msg.getTopico(), new CopyOnWriteArrayList<>());
                             dadosTopicos.putIfAbsent(msg.getTopico(), new HistoricoTopico());
-
-                            List<ObjectOutputStream> inscritosManual = topicosAtivos.get(msg.getTopico());
-                            if (!inscritosManual.contains(out)) {
-                                inscritosManual.add(out);
+                            List<TrataCliente> inscritosManual = topicosAtivos.get(msg.getTopico());
+                            if (!inscritosManual.contains(this)) {
+                                inscritosManual.add(this);
                                 dadosTopicos.get(msg.getTopico()).adicionarMembro(nomeDoCliente);
-                                System.out.println("SUB: " + nomeDoCliente + " se inscreveu em: " + msg.getTopico());
-                                enviarMensagensPendentesDoTopico(msg.getTopico());
                             }
-
-                            // --- CORREÇÃO 1: Envia ACK de confirmação ao cliente ---
-                            try {
-                                synchronized (out) {
-                                    out.writeUnshared(new Mensagem(Mensagem.TipoAcao.ACK, msg.getTopico(), "OK", "Broker"));
-                                    out.flush();
-                                    out.reset();
-                                }
-                            } catch (IOException e) { /* ignora falha no ACK */ }
+                            enviarMensagemParaCliente(new Mensagem(Mensagem.TipoAcao.ACK, msg.getTopico(), "OK", "Broker"));
+                            enviarMensagensPendentesDoTopico(msg.getTopico());
                             break;
 
                         case UNSUBSCRIBE:
-                            // --- CORREÇÃO 2: Entrega mensagens pendentes ANTES de remover o membro do histórico ---
                             enviarMensagensPendentesDoTopico(msg.getTopico());
                             removerClienteDoTopico(msg.getTopico());
                             break;
 
                         case PUBLISH:
-                            List<ObjectOutputStream> alvo = topicosAtivos.get(msg.getTopico());
-
-                            if (alvo == null || !alvo.contains(out)) {
-                                System.out.println("BLOQUEADO: " + nomeDoCliente + " tentou postar em " + msg.getTopico() + " sem estar inscrito.");
-                                break;
-                            }
-
-                            System.out.println("PUB: " + nomeDoCliente + " postou em " + msg.getTopico());
+                            List<TrataCliente> alvo = topicosAtivos.get(msg.getTopico());
+                            if (alvo == null || !alvo.contains(this)) break;
 
                             HistoricoTopico historico = dadosTopicos.get(msg.getTopico());
-                            if (historico != null) {
-                                historico.adicionarMensagem(msg);
-                            }
+                            if (historico != null) historico.adicionarMensagem(msg);
 
-                            for (ObjectOutputStream clienteOut : alvo) {
+                            for (TrataCliente clienteTratador : alvo) {
                                 try {
-                                    synchronized (clienteOut) {
-                                        clienteOut.writeUnshared(msg);
-                                        clienteOut.flush();
-                                        clienteOut.reset();
-                                    }
-                                    String nomeDestinatario = nomesConexoes.get(clienteOut);
+                                    clienteTratador.enviarMensagemParaCliente(msg);
+                                    String nomeDestinatario = nomesConexoes.get(clienteTratador);
                                     if (nomeDestinatario != null && historico != null) {
                                         historico.confirmarDownload(nomeDestinatario, msg);
                                     }
-                                } catch (IOException e) {
-                                    alvo.remove(clienteOut);
-                                }
+                                } catch (Exception e) { alvo.remove(clienteTratador); }
                             }
                             break;
+                        default: break;
                     }
                 }
             } catch (Exception e) {
-                System.out.println("Conexão encerrada: " + nomeDoCliente);
-                nomesConexoes.remove(out);
+                nomesConexoes.remove(this);
                 for (String t : topicosAtivos.keySet()) {
-                    List<ObjectOutputStream> lista = topicosAtivos.get(t);
-                    if (lista != null && lista.contains(out)) {
-                        lista.remove(out);
-                    }
+                    List<TrataCliente> lista = topicosAtivos.get(t);
+                    if (lista != null) lista.remove(this);
                 }
             }
         }
 
         private void removerClienteDoTopico(String topico) {
-            List<ObjectOutputStream> lista = topicosAtivos.get(topico);
+            List<TrataCliente> lista = topicosAtivos.get(topico);
             if (lista != null) {
-                lista.remove(out);
-                System.out.println("UNSUB: " + nomeDoCliente + " saiu de: " + topico);
+                lista.remove(this);
                 if (lista.isEmpty()) topicosAtivos.remove(topico);
             }
-
             HistoricoTopico hist = dadosTopicos.get(topico);
             if (hist != null) {
                 hist.removerMembro(nomeDoCliente);
-                if (hist.estaVazio()) {
-                    dadosTopicos.remove(topico);
-                    System.out.println("TOPICO EXCLUIDO: " + topico + " ficou sem membros e sem mensagens.");
-                }
+                if (hist.estaVazio()) dadosTopicos.remove(topico);
             }
         }
 
         private void enviarMensagensPendentes() {
-            for (String topico : dadosTopicos.keySet()) {
-                enviarMensagensPendentesDoTopico(topico);
-            }
+            for (String topico : dadosTopicos.keySet()) enviarMensagensPendentesDoTopico(topico);
         }
 
         private void enviarMensagensPendentesDoTopico(String topico) {
             HistoricoTopico hist = dadosTopicos.get(topico);
             if (hist != null) {
-                List<Mensagem> pendentes = hist.obterPendentesDoCliente(nomeDoCliente);
-                if (!pendentes.isEmpty()) {
-                    System.out.println("HISTORICO: Enviando " + pendentes.size() + " mensagens retidas em [" + topico + "] para " + nomeDoCliente);
-                    for (Mensagem m : pendentes) {
-                        try {
-                            synchronized (out) {
-                                out.writeUnshared(m);
-                                out.flush();
-                                out.reset();
-                            }
-                            hist.confirmarDownload(nomeDoCliente, m);
-                        } catch (IOException e) {
-                            break;
-                        }
-                    }
+                List<Mensagem> pendentes = new ArrayList<>(hist.obterPendentesDoCliente(nomeDoCliente));
+                for (Mensagem m : pendentes) {
+                    try {
+                        enviarMensagemParaCliente(m);
+                        hist.confirmarDownload(nomeDoCliente, m);
+                    } catch (Exception e) { break; }
                 }
             }
         }

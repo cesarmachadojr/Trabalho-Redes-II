@@ -2,6 +2,14 @@ import java.awt.*;
 import java.io.*;
 import java.net.*;
 import javax.swing.*;
+import java.security.*;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 public class ClienteGUI extends JFrame {
     private static final String IP_BROKER = "127.0.0.1";
@@ -12,7 +20,9 @@ public class ClienteGUI extends JFrame {
     private ObjectInputStream in;
     private String meuNome;
 
-    // Componentes da Interface Gráfica
+    private SecretKey chaveAES;
+    private boolean canalCifradoAtivo = false;
+
     private JTextField txtNome;
     private JButton btnConectar;
     private JTextField txtTopico;
@@ -26,13 +36,12 @@ public class ClienteGUI extends JFrame {
     private JButton btnEnviar;
 
     public ClienteGUI() {
-        super("IFSC - Sistema de Mensagens MQTT");
+        super("IFSC - Sistema de Mensagens MQTT Seguro");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setSize(800, 500);
         setLocationRelativeTo(null);
         setLayout(new BorderLayout(10, 10));
 
-        // 1. Painel Superior: Autenticação / Nome do Usuário
         JPanel painelSuperior = new JPanel(new FlowLayout(FlowLayout.LEFT));
         painelSuperior.setBorder(BorderFactory.createTitledBorder("Configuração de Identidade"));
         painelSuperior.add(new JLabel("Nome de Usuário:"));
@@ -42,7 +51,6 @@ public class ClienteGUI extends JFrame {
         painelSuperior.add(btnConectar);
         add(painelSuperior, BorderLayout.NORTH);
 
-        // 2. Painel Esquerdo: Gerenciamento de Múltiplos Tópicos
         JPanel painelEsquerdo = new JPanel(new BorderLayout(5, 5));
         painelEsquerdo.setBorder(BorderFactory.createTitledBorder("Seus Tópicos"));
         painelEsquerdo.setPreferredSize(new Dimension(250, 0));
@@ -67,13 +75,10 @@ public class ClienteGUI extends JFrame {
         JScrollPane scrollTopicos = new JScrollPane(listTopicos);
         scrollTopicos.setBorder(BorderFactory.createTitledBorder("Tópicos Ativos"));
         painelEsquerdo.add(scrollTopicos, BorderLayout.CENTER);
-
         add(painelEsquerdo, BorderLayout.WEST);
 
-        // 3. Painel Central: Chat e Envio de Mensagens
         JPanel painelCentral = new JPanel(new BorderLayout(5, 5));
         painelCentral.setBorder(BorderFactory.createTitledBorder("Painel de Mensagens"));
-
         areaChat = new JTextArea();
         areaChat.setEditable(false);
         areaChat.setFont(new Font("Monospaced", Font.PLAIN, 12));
@@ -85,17 +90,11 @@ public class ClienteGUI extends JFrame {
         painelEnvio.add(txtMensagem, BorderLayout.CENTER);
         painelEnvio.add(btnEnviar, BorderLayout.EAST);
         painelCentral.add(painelEnvio, BorderLayout.SOUTH);
-
         add(painelCentral, BorderLayout.CENTER);
 
-        // Bloquear componentes até conectar
         alternarComponentes(false);
 
-        // --- Listeners ---
-
         btnConectar.addActionListener(e -> conectarAoBroker());
-
-        // --- CORREÇÃO 1: Não adiciona na lista aqui; aguarda ACK do broker (tratado no OuvinteServidor) ---
         btnCriarTopico.addActionListener(e -> enviarComando(Mensagem.TipoAcao.CRIAR_TOPICO, txtTopico.getText().trim(), ""));
         btnInscrever.addActionListener(e -> enviarComando(Mensagem.TipoAcao.SUBSCRIBE, txtTopico.getText().trim(), ""));
 
@@ -103,10 +102,7 @@ public class ClienteGUI extends JFrame {
             String selecionado = listTopicos.getSelectedValue();
             if (selecionado != null) {
                 enviarComando(Mensagem.TipoAcao.UNSUBSCRIBE, selecionado, "");
-                // Remoção local imediata é segura aqui pois o broker entregará pendentes antes de remover
                 modelTopicos.removeElement(selecionado);
-            } else {
-                JOptionPane.showMessageDialog(this, "Selecione um tópico na lista para sair.");
             }
         });
 
@@ -126,20 +122,44 @@ public class ClienteGUI extends JFrame {
         btnEnviar.setEnabled(conectado);
     }
 
+    // CORREÇÃO: Aplica agora um IV dinâmico e aleatório por transmissão na Camada de Canal
+    private void transmitirMensagemNoSocket(Mensagem msg) throws Exception {
+        synchronized (out) {
+            if (this.canalCifradoAtivo) {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+                    oos.writeObject(msg);
+                }
+                byte[] dadosClaros = baos.toByteArray();
+
+                byte[] ivDinamico = new byte[16];
+                new SecureRandom().nextBytes(ivDinamico);
+
+                Cipher cipherAES = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                cipherAES.init(Cipher.ENCRYPT_MODE, this.chaveAES, new IvParameterSpec(ivDinamico));
+                byte[] dadosCifrados = cipherAES.doFinal(dadosClaros);
+
+                Mensagem envelope = new Mensagem(Mensagem.TipoAcao.MENSAGEM_CIFRADA_CANAL, "", "", meuNome);
+                envelope.setDadosCifradosCanal(dadosCifrados);
+                envelope.setIvCanal(ivDinamico); // Encaminha o IV dinâmico no payload DTO
+                out.writeUnshared(envelope);
+            } else {
+                out.writeUnshared(msg);
+            }
+            out.flush();
+            out.reset();
+        }
+    }
+
     private void conectarAoBroker() {
         meuNome = txtNome.getText().trim();
-        if (meuNome.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "Por favor, digite um nome de usuário válido.");
-            return;
-        }
+        if (meuNome.isEmpty()) return;
 
-        // --- AUTENTICAÇÃO: Carrega o arquivo de assinatura digital offline do cliente ---
         byte[] minhaAssinatura = null;
         try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(meuNome + ".assinatura"))) {
             minhaAssinatura = (byte[]) ois.readObject();
         } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "Erro de Autenticação: Arquivo '" + meuNome + ".assinatura' não encontrado!\n" +
-                    "Certifique-se de gerar as credenciais no Processo Offline primeiro.");
+            JOptionPane.showMessageDialog(this, "Assinatura local não encontrada!");
             return;
         }
 
@@ -147,110 +167,165 @@ public class ClienteGUI extends JFrame {
             socket = new Socket(IP_BROKER, PORTA_BROKER);
             out = new ObjectOutputStream(socket.getOutputStream());
             in = new ObjectInputStream(socket.getInputStream());
+            this.canalCifradoAtivo = false;
 
-            // Envia identificação com assinatura digital
-            out.writeObject(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "", meuNome, minhaAssinatura));
+            transmitirMensagemNoSocket(new Mensagem(Mensagem.TipoAcao.SOLICITAR_CERTIFICADO, "", "", meuNome));
+            java.security.cert.Certificate certificadoBroker = (java.security.cert.Certificate) in.readObject();
+
+            File arquivoCA = new File("ca.crt");
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            X509Certificate certificadoCA;
+            try (FileInputStream fis = new FileInputStream(arquivoCA)) {
+                certificadoCA = (X509Certificate) cf.generateCertificate(fis);
+            }
+
+            try {
+                certificadoBroker.verify(certificadoCA.getPublicKey());
+                areaChat.append("System: Certificado do Broker VALIDADO.\n");
+            } catch (Exception ex) {
+                socket.close();
+                return;
+            }
+
+            KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+            keyGen.init(256); 
+            this.chaveAES = keyGen.generateKey();
+            byte[] chaveBytes = chaveAES.getEncoded();
+
+            Cipher cipherRSA = Cipher.getInstance("RSA");
+            cipherRSA.init(Cipher.ENCRYPT_MODE, certificadoBroker.getPublicKey());
+            byte[] envelopeDigital = cipherRSA.doFinal(chaveBytes);
+
+            Mensagem msgEnvelope = new Mensagem(Mensagem.TipoAcao.CHAVE_SESSAO, "", "", meuNome);
+            msgEnvelope.setPayloadCifradoPontaAPonta(envelopeDigital);
+            
+            out.writeUnshared(msgEnvelope);
             out.flush();
+            out.reset();
+
+            this.canalCifradoAtivo = true;
+
+            Mensagem ackChave = (Mensagem) in.readObject();
+            if (ackChave.getAcao() == Mensagem.TipoAcao.MENSAGEM_CIFRADA_CANAL) {
+                Cipher decipherAES = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                decipherAES.init(Cipher.DECRYPT_MODE, this.chaveAES, new IvParameterSpec(ackChave.getIvCanal()));
+                byte[] dadosClaros = decipherAES.doFinal(ackChave.getDadosCifradosCanal());
+                try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(dadosClaros))) {
+                    ackChave = (Mensagem) ois.readObject();
+                }
+            }
+
+            areaChat.append("System: Canal Simétrico AES-256 estabelecido.\n");
+            transmitirMensagemNoSocket(new Mensagem(Mensagem.TipoAcao.IDENTIFICAR, "", "", meuNome, minhaAssinatura));
 
             alternarComponentes(true);
-            modelTopicos.clear(); // Limpa lista local; o broker vai reenviar ACKs dos tópicos ativos
-            areaChat.append("System: Conectado com sucesso como [" + meuNome + "]\n");
-
-            // Inicia thread ouvinte do Broker
+            modelTopicos.clear();
             new Thread(new OuvinteServidor()).start();
 
-        } catch (IOException ex) {
-            JOptionPane.showMessageDialog(this, "Erro ao conectar no Broker (Verifique se ele está rodando).");
-        }
+        } catch (Exception ex) { ex.printStackTrace(); }
     }
 
-    // --- CORREÇÃO 1: Removido o parâmetro adicionarNaLista; adição ocorre somente via ACK ---
     private void enviarComando(Mensagem.TipoAcao acao, String topico, String payload) {
-        if (topico.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "Preencha o nome do tópico.");
-            return;
-        }
+        if (topico.isEmpty()) return;
         try {
-            out.writeObject(new Mensagem(acao, topico, payload, meuNome));
-            out.flush();
+            transmitirMensagemNoSocket(new Mensagem(acao, topico, payload, meuNome));
             txtTopico.setText("");
-        } catch (IOException ex) {
-            areaChat.append("System: Falha ao enviar comando para o broker.\n");
-        }
+        } catch (Exception ex) { ex.printStackTrace(); }
     }
 
     private void enviarMensagemPublicacao() {
         String topicoSelecionado = listTopicos.getSelectedValue();
         String texto = txtMensagem.getText().trim();
 
-        if (topicoSelecionado == null) {
-            JOptionPane.showMessageDialog(this, "Selecione na lista lateral esquerda qual o tópico alvo da mensagem.");
-            return;
-        }
-        if (texto.isEmpty()) return;
+        if (topicoSelecionado == null || texto.isEmpty()) return;
 
         try {
-            out.writeObject(new Mensagem(Mensagem.TipoAcao.PUBLISH, topicoSelecionado, texto, meuNome));
-            out.flush();
+            byte[] chaveTopicoBytes = new byte[16];
+            byte[] topicoBytes = topicoSelecionado.getBytes("UTF-8");
+            System.arraycopy(topicoBytes, 0, chaveTopicoBytes, 0, Math.min(topicoBytes.length, 16));
+            SecretKeySpec chaveCompartilhadaTopico = new SecretKeySpec(chaveTopicoBytes, "AES");
+
+            byte[] ivEstaticoPontaAPonta = new byte[16]; // Mantido estático apenas para o ponta-a-ponta simplificado por tópico
+            IvParameterSpec ivSpecPontaAPonta = new IvParameterSpec(ivEstaticoPontaAPonta);
+
+            Cipher cipherAES = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            cipherAES.init(Cipher.ENCRYPT_MODE, chaveCompartilhadaTopico, ivSpecPontaAPonta);
+            byte[] textoCifradoBytes = cipherAES.doFinal(texto.getBytes("UTF-8"));
+
+            Mensagem msgPublish = new Mensagem(Mensagem.TipoAcao.PUBLISH, topicoSelecionado, "[CONTEÚDO PROTEGIDO]", meuNome);
+            msgPublish.setPayloadCifradoPontaAPonta(textoCifradoBytes);
+
+            transmitirMensagemNoSocket(msgPublish);
             txtMensagem.setText("");
-        } catch (IOException ex) {
-            areaChat.append("System: Falha ao publicar mensagem.\n");
-        }
+        } catch (Exception ex) { ex.printStackTrace(); }
     }
 
-    // Thread que escuta o servidor continuamente sem travar a janela
     private class OuvinteServidor implements Runnable {
         @Override
         public void run() {
             try {
                 while (true) {
-                    Mensagem msg = (Mensagem) in.readObject();
+                    Mensagem msgEntrada = (Mensagem) in.readObject();
+                    Mensagem msg = msgEntrada;
 
-                    // --- AUTENTICAÇÃO: Trata recusa de conexão ---
+                    // CORREÇÃO: Lê o IV dinâmico que o Broker colocou nesta mensagem específica
+                    if (msgEntrada.getAcao() == Mensagem.TipoAcao.MENSAGEM_CIFRADA_CANAL) {
+                        Cipher decipherAES = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                        decipherAES.init(Cipher.DECRYPT_MODE, chaveAES, new IvParameterSpec(msgEntrada.getIvCanal()));
+                        byte[] dadosClaros = decipherAES.doFinal(msgEntrada.getDadosCifradosCanal());
+                        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(dadosClaros))) {
+                            msg = (Mensagem) ois.readObject();
+                        }
+                    }
+
                     if ("ERRO_AUTENTICACAO".equals(msg.getPayload())) {
-                        SwingUtilities.invokeLater(() -> {
-                            JOptionPane.showMessageDialog(ClienteGUI.this,
-                                "O Servidor recusou o login: Assinatura digital inválida ou corrompida!",
-                                "Erro de Segurança", JOptionPane.ERROR_MESSAGE);
-                            alternarComponentes(false);
-                            modelTopicos.clear();
-                        });
+                        alternarComponentes(false);
                         break;
                     }
 
-                    // --- CORREÇÃO 1: Trata ACK do broker para adicionar tópico na lista apenas após confirmação ---
                     if (msg.getAcao() == Mensagem.TipoAcao.ACK) {
                         if ("OK".equals(msg.getPayload())) {
                             String topico = msg.getTopico();
                             SwingUtilities.invokeLater(() -> {
-                                if (!modelTopicos.contains(topico)) {
-                                    modelTopicos.addElement(topico);
-                                }
-                                areaChat.append("System: Inscrição confirmada no tópico [" + topico + "]\n");
+                                if (!modelTopicos.contains(topico)) modelTopicos.addElement(topico);
                             });
                         }
-                        continue; // ACK processado, não exibe como mensagem de chat
+                        continue;
                     }
 
-                    // Exibe mensagem de chat com cliente e tópico de origem
-                    String formatada = String.format("[%s - %s]: %s\n",
-                            msg.getRemetente(),
-                            msg.getTopico(),
-                            msg.getPayload()
-                    );
-                    SwingUtilities.invokeLater(() -> areaChat.append(formatada));
+                    String payloadTextoExibicao = msg.getPayload();
+                    if (msg.getAcao() == Mensagem.TipoAcao.PUBLISH && msg.getPayloadCifradoPontaAPonta() != null) {
+                        try {
+                            String topicoMensagem = msg.getTopico();
+                            byte[] chaveTopicoBytes = new byte[16];
+                            byte[] topicoBytes = topicoMensagem.getBytes("UTF-8");
+                            System.arraycopy(topicoBytes, 0, chaveTopicoBytes, 0, Math.min(topicoBytes.length, 16));
+                            SecretKeySpec chaveCompartilhadaTopico = new SecretKeySpec(chaveTopicoBytes, "AES");
+
+                            byte[] ivEstaticoPontaAPonta = new byte[16];
+                            IvParameterSpec ivSpecPontaAPonta = new IvParameterSpec(ivEstaticoPontaAPonta);
+
+                            Cipher decipherAES = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                            decipherAES.init(Cipher.DECRYPT_MODE, chaveCompartilhadaTopico, ivSpecPontaAPonta);
+                            
+                            byte[] textoDecifradoBytes = decipherAES.doFinal(msg.getPayloadCifradoPontaAPonta());
+                            payloadTextoExibicao = new String(textoDecifradoBytes, "UTF-8");
+                        } catch (Exception ex) {
+                            payloadTextoExibicao = "[Erro ao decifrar conteúdo ponta-a-ponta]";
+                        }
+                    }
+
+                    final String msgFinal = payloadTextoExibicao;
+                    final String exibir = String.format("[%s - %s]: %s\n", msg.getRemetente(), msg.getTopico(), msgFinal);
+                    SwingUtilities.invokeLater(() -> areaChat.append(exibir));
                 }
             } catch (Exception e) {
-                SwingUtilities.invokeLater(() -> {
-                    areaChat.append("System: Conexão com o Broker perdida.\n");
-                    alternarComponentes(false);
-                });
+                SwingUtilities.invokeLater(() -> alternarComponentes(false));
             }
         }
     }
 
     public static void main(String[] args) {
-        try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception e) {}
         SwingUtilities.invokeLater(() -> new ClienteGUI().setVisible(true));
     }
 }
